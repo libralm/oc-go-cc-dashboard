@@ -196,6 +196,7 @@ input { padding:5px 8px; background:var(--input-bg); color:var(--text); border:1
   <div style="margin-top:10px;display:flex;gap:8px">
     <button class="btn btn-accent" onclick="saveConfig()">保存并重启代理</button>
     <button class="btn" onclick="location.reload()">刷新</button>
+    <button class="btn btn-sm" onclick="exportConfig()">导出配置</button>
   </div>
 </div>
 
@@ -493,6 +494,25 @@ async function saveConfig() {
   } catch(e) { toast('网络错误','err'); }
 }
 
+async function exportConfig() {
+  try {
+    var r = await fetch('/api/config');
+    var d = await r.json();
+    var config = d.config || {};
+    // Sanitize for export
+    if (config.api_key && config.api_key.length > 16) {
+      config.api_key = '${OC_GO_CC_API_KEY}';
+    }
+    var blob = new Blob([JSON.stringify(config, null, 2)], {type:'application/json'});
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'config-' + new Date().toISOString().slice(0,10) + '.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('配置已下载','ok');
+  } catch(e) { toast('导出失败','err'); }
+}
+
 // ── Presets ──
 function renderPresets(ps) {
   var sel = $('preset-select');
@@ -573,9 +593,19 @@ function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 // ── Theme ──
 function toggleTheme() {
   document.body.classList.toggle('light');
-  $('btn-theme').textContent = document.body.classList.contains('light') ? '🌙 深色' : '☀ 浅色';
+  var isLight = document.body.classList.contains('light');
+  $('btn-theme').textContent = isLight ? '🌙 深色' : '☀ 浅色';
+  try { localStorage.setItem('oc-dash-theme', isLight ? 'light' : 'dark'); } catch(e) {}
   renderLatencyTrend();
 }
+(function initTheme() {
+  try {
+    if (localStorage.getItem('oc-dash-theme') === 'light') {
+      document.body.classList.add('light');
+      $('btn-theme').textContent = '🌙 深色';
+    }
+  } catch(e) {}
+})();
 
 // ── Refresh control ──
 function toggleRefresh() {
@@ -1243,6 +1273,30 @@ def monitor_logs():
             pass
 
 
+def watchdog_loop():
+    """Background thread: monitor proxy health and restart if dead."""
+    consecutive = 0
+    while True:
+        time.sleep(30)
+        try:
+            import urllib.request
+            req = urllib.request.Request(HEALTH_URL)
+            resp = urllib.request.urlopen(req, timeout=5)
+            data = json.loads(resp.read())
+            if data.get("status") == "ok":
+                consecutive = 0
+                continue
+        except Exception:
+            pass
+        consecutive += 1
+        if consecutive >= 3:
+            try:
+                restart_proxy()
+                consecutive = 0
+            except Exception:
+                pass
+
+
 # ── Daemonize ──
 
 def daemonize():
@@ -1292,9 +1346,11 @@ def main():
     server = HTTPServer((HOST, args.port), Handler)
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
-    # Start background key exhaustion monitor
+    # Start background threads
     monitor_thread = threading.Thread(target=monitor_logs, daemon=True)
     monitor_thread.start()
+    watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
+    watchdog_thread.start()
     if not args.background:
         print(f"oc-go-cc Dashboard v2 → http://{HOST}:{args.port}")
     try:
