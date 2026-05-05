@@ -1,0 +1,15 @@
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "unused",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3456",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_REASONING_MODEL": "claude-opus-4-7"
+  },
+  "effort": "max",
+  "permissionMode": "bypassPermissions",
+  "verbose": true,
+  "includeCoAuthoredBy": false
+}

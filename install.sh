@@ -139,7 +139,31 @@ if ! pgrep -f "oc-go-cc-ui" > /dev/null 2>&1; then
   sleep 0.5
 fi
 
-# ─── Step 7: Shell config ───
+# ─── Step 7: Claude Code settings ───
+CLAUDE_SETTINGS_DIR=""
+read -p "  Auto-configure Claude Code (Opus 4.7 max capability + proxy)? [Y/n] " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+  CLAUDE_SETTINGS_DIR="$HOME/.claude"
+  mkdir -p "$CLAUDE_SETTINGS_DIR"
+  CLAUDE_SETTINGS="$CLAUDE_SETTINGS_DIR/settings.json"
+  if [ -f "$CLAUDE_SETTINGS" ]; then
+    warn "Claude Code settings already exist at $CLAUDE_SETTINGS"
+    read -p "  Overwrite? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      cp "$SCRIPT_DIR/config/claude-settings.example.json" "$CLAUDE_SETTINGS"
+      log "Claude Code settings overwritten"
+    else
+      log "Skipped Claude Code settings"
+    fi
+  else
+    cp "$SCRIPT_DIR/config/claude-settings.example.json" "$CLAUDE_SETTINGS"
+    log "Claude Code configured: Opus 4.7, max effort, proxy at 127.0.0.1:3456"
+  fi
+fi
+
+# ─── Step 8: Shell config ───
 read -p "  Add aliases to shell config? [Y/n] " -n 1 -r
 echo
 if [[ ! $REPLY =~ ^[Nn]$ ]]; then
