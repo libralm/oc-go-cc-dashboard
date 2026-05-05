@@ -1,45 +1,58 @@
 # oc-go-cc Dashboard
 
-A beautiful web-based monitoring dashboard for [oc-go-cc](https://github.com/samueltuyizere/oc-go-cc) proxy.
+一个美观的 Web 监控面板，为 [oc-go-cc](https://github.com/samueltuyizere/oc-go-cc) 代理提供可视化管理。
 
-oc-go-cc lets you use your [OpenCode Go](https://opencode.ai) subscription with Claude Code. This dashboard provides real-time monitoring, model switching, circuit breaker management, and more — all through an intuitive web interface.
-
-<p align="center">
-  <img src="screenshots/dashboard.png" alt="Dashboard Screenshot" width="800">
-</p>
+oc-go-cc 让你用 [OpenCode Go](https://opencode.ai) 订阅驱动 Claude Code。本 Dashboard 提供实时监控、模型切换、熔断器管理、API Key 管理、用量统计等功能。
 
 ## Features
 
-### 📊 Real-time Monitoring
-- **6 key metrics** — total requests, success/failure counts, P95/P99 latency, streaming requests
-- **Trend arrows** — compare current vs previous poll, see ↑↓ changes instantly
-- **5-second auto-refresh** with pause toggle
+### 📊 实时监控
+- **6 项核心指标** — 总请求、成功/失败数、P95/P99 延迟、流式请求
+- **趋势箭头** — 对比上次轮询，显示 ↑↓ 变化
+- **5 秒自动刷新**，支持暂停
 
-### ⚡ Circuit Breaker Management
-- Per-model status indicators (green=closed, red=open, yellow=half-open)
-- Overall health percentage
-- One-click reset all circuit breakers
+### 🔑 API Key 管理（多 Key + 自动切换）
+- 从面板添加多个 OpenCode Go API Key
+- 当前激活的 Key 绿色标识，已耗尽的红色标识
+- **自动故障转移**：后台监控日志，检测到 `429` / `insufficient_quota` 后自动切换到下一个可用 Key
+- Key 遮罩显示，前端不暴露完整 Key
 
-### 📈 Visual Analytics
-- **Model usage bar chart** — distribution of requests across models
-- **Latency trend line chart** — last 60 requests with P95 reference line
-- **Request timeline** — recent 30 requests with status, model, and latency
+### 📈 用量统计
+- 今日 Token 消耗进度条（绿→黄→红）
+- 按模型细分的 Token 用量 + 请求次数
+- 基于 $10/月套餐的预算估算
+- 数据持久化到本地 `usage.json`
 
-### 🎛️ Model Configuration
-- 6 routing scenarios, each independently configurable
-- **Preset system** — save/load/delete model configurations
-- Includes two presets: `develop` (all deepseek-v4-pro) and `economy` (kimi/glm/qwen mix)
+### ⚡ 熔断器管理
+- 每模型独立状态指示（绿=正常、红=熔断、黄=半开）
+- 整体健康度百分比
+- 一键重置所有熔断器
 
-### 📝 Log Viewer
-- Search and keyword highlighting
-- Quick filter buttons (All / Errors / Warnings / Success)
-- Auto-follow mode
+### 📈 可视化分析
+- **模型用量柱状图** — 各模型请求分布
+- **延迟趋势折线图** — 最近 60 次请求 + P95 参考线
+- **请求时间线** — 最近 30 条，彩色标签区分成功/失败
+
+### 🎛️ 模型配置
+- 6 个路由场景独立配置模型
+- **预设系统** — 保存/加载/删除多套模型配置
+- 预装两个预设：`开发模式`（全 deepseek-v4-pro）和 `省钱模式`（混用 kimi/glm/qwen）
+
+### 📝 日志查看
+- 搜索和关键字高亮
+- 快捷筛选（全部/错误/警告/成功）
+- 自动跟随模式
 
 ### 🎨 UI
-- Dark/light theme toggle
-- Chinese (中文) interface
-- Zero external dependencies — pure Python + vanilla HTML/CSS/JS
-- Browser notifications for circuit breaker trips
+- 深色/浅色主题切换
+- 全中文界面
+- 零外部依赖 — 纯 Python + 原生 HTML/CSS/JS
+- 浏览器通知（熔断器打开或错误率 > 50% 时告警）
+
+### 🚀 Claude Code 配置模板
+- 预置 `claude-settings.example.json`，一键让 Claude Code 以 Opus 4.7 模式运行
+- `effort: max` 最大化推理能力
+- `install.sh` 可自动配置 Claude Code
 
 ## Architecture
 
@@ -48,7 +61,12 @@ Claude Code ──Anthropic API──▶ oc-go-cc proxy (127.0.0.1:3456) ──O
                                       │
                                       ├── /health
                                       ├── /v1/messages
-                                      └── logs ──▶ Dashboard (127.0.0.1:3457) reads logs & health
+                                      └── logs ──▶ Dashboard (127.0.0.1:3457)
+                                                       │
+                                                       ├── 实时指标 + 熔断器
+                                                       ├── 模型用量 + 延迟趋势
+                                                       ├── API Key 管理 + 自动切换
+                                                       └── 配置预设 + 日志搜索
 ```
 
 ## Quick Start
@@ -56,160 +74,188 @@ Claude Code ──Anthropic API──▶ oc-go-cc proxy (127.0.0.1:3456) ──O
 ### Prerequisites
 - macOS (arm64 or amd64)
 - Python 3
-- An [OpenCode Go](https://opencode.ai/auth) API key (`sk-opencode-...`)
+- 一个 [OpenCode Go](https://opencode.ai/auth) API Key（格式 `sk-opencode-...`）
 
-### Install
+### 一键安装
 
 ```bash
-# Set your API key
+# 设置 API Key
 export OC_GO_CC_API_KEY=sk-opencode-your-key-here
 
-# Clone and install
-git clone https://github.com/YOUR_USERNAME/oc-go-cc-dashboard.git
+# 克隆并安装
+git clone https://github.com/libralm/oc-go-cc-dashboard.git
 cd oc-go-cc-dashboard
 ./install.sh
 ```
 
-After installation:
-- **Proxy**: `http://127.0.0.1:3456`
-- **Dashboard**: `http://127.0.0.1:3457`
+安装过程会自动完成：
+- ✅ 下载 oc-go-cc 代理
+- ✅ 安装 Dashboard 脚本
+- ✅ 初始化配置文件
+- ✅ 设置 launchd 开机自启
+- ✅ 可选：自动配置 Claude Code（Opus 4.7 + max effort）
+- ✅ 可选：添加 shell 别名
 
-### Configure Claude Code
+安装完成后：
+- **代理**: `http://127.0.0.1:3456`
+- **面板**: `http://127.0.0.1:3457`
 
-Add to your Claude Code settings (`~/.claude/settings.json`):
+## Claude Code 配置
+
+本仓库包含 `config/claude-settings.example.json`，配置了 Claude Code 的最高能力模式：
 
 ```json
 {
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "unused",
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:3456",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-pro",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-pro"
-  }
+    "ANTHROPIC_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-opus-4-7"
+  },
+  "effort": "max",
+  "permissionMode": "bypassPermissions",
+  "verbose": true
 }
 ```
 
-Or set environment variables:
+> Claude Code 以为是 Opus 4.7，实际 API 请求走 oc-go-cc 代理 → OpenCode Go。
+> 代理不看模型名，只看请求内容路由。所以填任何模型名都不影响实际使用的后端模型。
+
+## 使用
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
-export ANTHROPIC_AUTH_TOKEN=unused
-```
-
-## Usage
-
-```bash
-# Open the dashboard in your browser
+# 浏览器打开面板
 open http://127.0.0.1:3457
 
-# Or use the alias (if installed via install.sh)
+# 或用别名
 dashboard
 ```
 
-### Managing the proxy
+### 管理代理
 
 ```bash
-oc-go-cc status       # Check proxy status
-oc-go-cc stop         # Stop proxy
-oc-go-cc serve -b     # Start proxy in background
+oc-go-cc status       # 查看状态
+oc-go-cc stop         # 停止
+oc-go-cc serve -b     # 后台启动
 ```
 
-### Managing the dashboard
+### 管理面板
 
 ```bash
-oc-go-cc-ui           # Start dashboard (foreground)
-oc-go-cc-ui -b        # Start dashboard (background)
-oc-go-cc-ui --stop    # Stop dashboard
+oc-go-cc-ui           # 前台启动
+oc-go-cc-ui -b        # 后台启动
+oc-go-cc-ui --stop    # 停止
 ```
 
-## Routing Scenarios
+## 路由场景
 
-The proxy auto-selects models based on request context:
+代理根据请求内容自动选择模型（可在面板中随时修改）：
 
-| Scenario | Trigger | Default Model |
-|----------|---------|---------------|
-| `default` | All unmatched requests | deepseek-v4-pro |
-| `think` | Prompt contains think/plan | deepseek-v4-pro |
-| `complex` | Prompt contains architect/refactor | deepseek-v4-pro |
-| `long_context` | Input > 80K tokens | deepseek-v4-pro |
-| `background` | Simple tool calls (read, grep) | qwen3.6-plus |
-| `fast` | Streaming responses | deepseek-v4-flash |
+| 场景 | 触发条件 | 默认模型 |
+|------|----------|----------|
+| `default` | 所有未匹配的请求 | deepseek-v4-pro |
+| `think` | 提示词含 think/plan | deepseek-v4-pro |
+| `complex` | 提示词含 architect/refactor | deepseek-v4-pro |
+| `long_context` | 输入 > 80K token | deepseek-v4-pro |
+| `background` | 文件读取等简单操作 | qwen3.6-plus |
+| `fast` | 流式响应 | deepseek-v4-flash |
 
-All configurable via the dashboard or `~/.config/oc-go-cc/config.json`.
+## 预设
 
-## Presets
+预装两个预设：
 
-Two presets are included:
+| 预设 | 主要模型 | 用途 |
+|------|----------|------|
+| `开发模式` | 全部 deepseek-v4-pro | 最强推理能力 |
+| `省钱模式` | kimi-k2.6 / glm-5.1 / qwen3.6-plus 混用 | 降低成本 |
 
-| Preset | Primary Models | Use Case |
-|--------|---------------|----------|
-| `develop` (开发模式) | deepseek-v4-pro (all scenarios) | Maximum reasoning capability |
-| `economy` (省钱模式) | kimi-k2.6 / glm-5.1 / qwen3.6-plus mix | Lower cost, solid performance |
+可通过面板 UI 保存自定义预设，或手动复制 JSON 文件到 `~/.config/oc-go-cc/presets/`。
 
-Save your own presets via the dashboard UI or copy JSON files to `~/.config/oc-go-cc/presets/`.
+## API Key 自动故障转移
 
-## Manual Installation
+工作原理：
+1. 后台线程每 15 秒扫描代理日志
+2. 检测到 `429` / `insufficient_quota` / `exceeded your current quota`
+3. 连续 3 次配额错误后，标记当前 Key 为"已耗尽"
+4. 自动激活下一个可用 Key，重启代理
+5. 前端实时显示切换次数
 
-If you prefer not to use the install script:
+Key 数据存储结构（`~/.config/oc-go-cc/keys.json`）：
+```json
+{
+  "keys": [
+    {"key": "sk-xxx", "label": "主账号", "exhausted": false},
+    {"key": "sk-yyy", "label": "备用", "exhausted": true}
+  ],
+  "active_index": 0
+}
+```
 
-1. **Install oc-go-cc proxy**
+## 手动安装
+
+如果不使用 install.sh：
+
+1. **安装 oc-go-cc 代理**
    ```bash
    curl -fSL "https://github.com/samueltuyizere/oc-go-cc/releases/latest/download/oc-go-cc_$(uname -m | sed 's/arm64/darwin-arm64/;s/x86_64/darwin-amd64/')" -o ~/.local/bin/oc-go-cc
    chmod +x ~/.local/bin/oc-go-cc
    ```
 
-2. **Initialize config**
+2. **初始化配置**
    ```bash
    oc-go-cc init
-   # Edit ~/.config/oc-go-cc/config.json to add your API key
+   # 编辑 ~/.config/oc-go-cc/config.json 填入 API Key
    ```
 
-3. **Install dashboard**
+3. **安装面板**
    ```bash
    cp dashboard/oc-go-cc-ui ~/.local/bin/oc-go-cc-ui
    chmod +x ~/.local/bin/oc-go-cc-ui
    ```
 
-4. **Start services**
+4. **启动服务**
    ```bash
    oc-go-cc serve -b
    oc-go-cc-ui -b
    ```
 
-5. **Open dashboard**: http://127.0.0.1:3457
+5. **打开面板**: http://127.0.0.1:3457
 
-## Directory Structure
+## 目录结构
 
 ```
 oc-go-cc-dashboard/
 ├── README.md
-├── install.sh                        # One-click installer
+├── install.sh                           # 一键安装脚本
 ├── .gitignore
 ├── dashboard/
-│   └── oc-go-cc-ui                  # Dashboard Python script (single-file)
+│   └── oc-go-cc-ui                     # 面板主程序（单文件 Python）
 ├── config/
-│   ├── config.example.json          # Example proxy configuration
+│   ├── config.example.json             # 代理配置模板
+│   ├── claude-settings.example.json    # Claude Code 配置模板
 │   └── presets/
-│       ├── 开发模式.json             # "Develop" preset
-│       └── 省钱模式.json             # "Economy" preset
+│       ├── 开发模式.json                # 全 deepseek-v4-pro
+│       └── 省钱模式.json                # 混用低成本模型
 └── launchd/
-    ├── com.opencode.oc-go-cc.plist             # Proxy auto-start
-    └── com.opencode.oc-go-cc-dashboard.plist   # Dashboard auto-start
+    ├── com.opencode.oc-go-cc.plist             # 代理开机自启
+    └── com.opencode.oc-go-cc-dashboard.plist   # 面板开机自启
 ```
 
-## Security
+## 安全
 
-- **Never commit your API key**. The `.gitignore` excludes `config.json`. Use environment variables (`OC_GO_CC_API_KEY`) or keep your config private.
-- All traffic between Claude Code → proxy → OpenCode Go is HTTPS (proxy ↔ OpenCode Go) or localhost (Claude Code ↔ proxy).
-- The dashboard binds to `127.0.0.1` only (localhost).
+- **不要提交 API Key**。`.gitignore` 已排除 `config.json`。
+- 所有流量：Claude Code ↔ 代理（localhost）→ OpenCode Go（HTTPS）
+- 面板仅绑定 `127.0.0.1`（仅本机访问）
+- API Key 在前端 API 响应中已遮罩（如 `sk-90wSbrT...HFYdC8`）
 
-## Tech Stack
+## 技术栈
 
-- **Backend**: Python 3 `http.server` (stdlib, zero dependencies)
-- **Frontend**: Vanilla HTML/CSS/JavaScript (no frameworks, no CDN)
-- **Charts**: Canvas API (built into browsers)
-- **Proxy**: [oc-go-cc](https://github.com/samueltuyizere/oc-go-cc) by [@samueltuyizere](https://github.com/samueltuyizere)
+- **后端**: Python 3 `http.server`（标准库，零依赖）
+- **前端**: 原生 HTML/CSS/JavaScript（零框架，零 CDN）
+- **图表**: Canvas API（浏览器内置）
+- **代理**: [oc-go-cc](https://github.com/samueltuyizere/oc-go-cc) by [@samueltuyizere](https://github.com/samueltuyizere)
 
 ## License
 
@@ -217,6 +263,6 @@ MIT
 
 ## Credits
 
-- [oc-go-cc](https://github.com/samueltuyizere/oc-go-cc) — The proxy that makes this all possible
-- [OpenCode](https://opencode.ai) — The AI coding agent platform
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's official CLI tool
+- [oc-go-cc](https://github.com/samueltuyizere/oc-go-cc) — 代理项目
+- [OpenCode](https://opencode.ai) — AI 编程平台
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic 官方 CLI 工具
