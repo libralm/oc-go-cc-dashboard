@@ -1,0 +1,21 @@
+# Private config (contains API keys)
+config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+oc-go-cc.log
+dashboard.log
+
+# PID files
+*.pid
+
+# IDE
+.idea/
+.vscode/

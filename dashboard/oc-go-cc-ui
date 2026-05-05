@@ -1,0 +1,1011 @@
+#!/usr/bin/env python3
+"""oc-go-cc Web Dashboard v2 — full monitoring panel for OpenCode Go proxy."""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import threading
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+CONFIG_PATH = Path.home() / ".config/oc-go-cc/config.json"
+PRESETS_DIR = Path.home() / ".config/oc-go-cc/presets"
+BINARY = Path.home() / ".local/bin/oc-go-cc"
+LOG_PATH = Path.home() / ".config/oc-go-cc/oc-go-cc.log"
+PID_FILE = Path.home() / ".config/oc-go-cc/dashboard.pid"
+HEALTH_URL = "http://127.0.0.1:3456/health"
+PROXY_URL = "http://127.0.0.1:3456/v1/messages"
+HOST = "127.0.0.1"
+PORT = 3457
+START_TIME = time.time()
+
+# --- Last metrics for trend comparison ---
+_last_metrics = {}
+
+# --- HTML TEMPLATE ---
+HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>oc-go-cc 管理面板</title>
+<style>
+:root {
+  --bg: #0d1117; --card: #161b22; --border: #30363d;
+  --text: #c9d1d9; --text2: #8b949e; --text3: #484f58;
+  --accent: #58a6ff; --green: #3fb950; --red: #f85149;
+  --yellow: #d29922; --purple: #a371f7;
+  --btn-hover: #21262d; --input-bg: #0d1117;
+}
+.light {
+  --bg: #ffffff; --card: #f6f8fa; --border: #d0d7de;
+  --text: #24292f; --text2: #656d76; --text3: #afb8c1;
+  --accent: #0969da; --green: #1a7f37; --red: #cf222e;
+  --yellow: #9a6700; --purple: #8250df;
+  --btn-hover: #eaeef2; --input-bg: #f6f8fa;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif; background:var(--bg); color:var(--text); padding:20px; min-height:100vh; }
+.header { display:flex; align-items:center; gap:16px; padding:12px 16px; background:var(--card); border:1px solid var(--border); border-radius:10px; margin-bottom:16px; flex-wrap:wrap; }
+.header .logo { font-size:18px; font-weight:700; color:var(--accent); }
+.header .status { display:flex; align-items:center; gap:6px; font-size:13px; }
+.header .info { font-size:12px; color:var(--text2); margin-left:auto; }
+.dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+.dot-green { background:var(--green); box-shadow:0 0 6px var(--green); }
+.dot-red { background:var(--red); box-shadow:0 0 6px var(--red); }
+.dot-yellow { background:var(--yellow); }
+.header-actions { display:flex; gap:6px; flex-wrap:wrap; }
+.btn { padding:6px 12px; border:1px solid var(--border); border-radius:6px; font-size:12px; font-family:inherit; cursor:pointer; background:var(--card); color:var(--text); transition:all .15s; white-space:nowrap; }
+.btn:hover { background:var(--btn-hover); }
+.btn-accent { background:var(--accent); color:#fff; border-color:var(--accent); }
+.btn-accent:hover { background:var(--accent); opacity:.85; }
+.btn-green { background:var(--green); color:#fff; border-color:var(--green); }
+.btn-red { background:var(--red); color:#fff; border-color:var(--red); }
+.btn-sm { padding:3px 8px; font-size:11px; }
+.metrics-row { display:grid; grid-template-columns:repeat(6,1fr); gap:10px; margin-bottom:16px; }
+@media(max-width:900px) { .metrics-row { grid-template-columns:repeat(3,1fr); } }
+.metric-card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:14px; text-align:center; }
+.metric-card .value { font-size:24px; font-weight:700; color:var(--accent); }
+.metric-card .label { font-size:11px; color:var(--text2); margin-top:4px; }
+.metric-card .trend { font-size:11px; margin-top:4px; }
+.trend-up { color:var(--green); }
+.trend-down { color:var(--red); }
+.trend-flat { color:var(--text3); }
+.main-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px; }
+@media(max-width:900px) { .main-grid { grid-template-columns:1fr; } }
+.card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; }
+.card h3 { font-size:13px; color:var(--text); margin-bottom:12px; display:flex; align-items:center; gap:8px; }
+.card h3 .badge { font-size:10px; padding:2px 6px; border-radius:10px; background:var(--border); color:var(--text2); }
+.full { grid-column:1/-1; }
+.circuit-row { display:flex; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); gap:10px; }
+.circuit-row:last-child { border-bottom:none; }
+.circuit-row .name { flex:1; font-size:12px; font-weight:500; }
+.circuit-row .state { font-size:11px; padding:2px 8px; border-radius:10px; }
+.state-closed { background:#1a3a2a; color:var(--green); }
+.state-open { background:#3a1a1a; color:var(--red); }
+.state-half { background:#3a2a1a; color:var(--yellow); }
+.circuit-health { font-size:12px; color:var(--text2); margin-top:8px; }
+.timeline { max-height:320px; overflow-y:auto; }
+.timeline-item { display:flex; align-items:center; padding:6px 8px; border-radius:6px; gap:8px; font-size:12px; margin-bottom:2px; }
+.timeline-item:nth-child(odd) { background:var(--bg); }
+.timeline-time { color:var(--text3); width:46px; flex-shrink:0; }
+.timeline-model { width:115px; flex-shrink:0; color:var(--text2); font-size:11px; }
+.timeline-latency { color:var(--accent); width:48px; text-align:right; flex-shrink:0; }
+.timeline-status { width:32px; text-align:center; flex-shrink:0; }
+.status-ok { color:var(--green); }
+.status-err { color:var(--red); }
+.status-warn { color:var(--yellow); }
+.usage-bar-wrap { display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:12px; }
+.usage-bar-wrap .label { width:115px; flex-shrink:0; text-align:right; }
+.usage-bar-wrap .bar-bg { flex:1; height:18px; background:var(--bg); border-radius:4px; overflow:hidden; }
+.usage-bar-wrap .bar-fill { height:100%; border-radius:4px; transition:width .4s; min-width:2px; }
+.usage-bar-wrap .count { width:40px; text-align:right; color:var(--text2); flex-shrink:0; }
+canvas { width:100%; height:160px; display:block; border-radius:6px; background:var(--bg); }
+.config-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; flex-wrap:wrap; }
+.config-row label { width:80px; font-size:12px; color:var(--text2); text-align:right; flex-shrink:0; }
+select { padding:5px 8px; background:var(--input-bg); color:var(--text); border:1px solid var(--border); border-radius:6px; font-size:12px; font-family:inherit; cursor:pointer; min-width:160px; }
+select:focus, input:focus { outline:none; border-color:var(--accent); }
+input { padding:5px 8px; background:var(--input-bg); color:var(--text); border:1px solid var(--border); border-radius:6px; font-size:12px; font-family:inherit; }
+.logs { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:10px; font-size:11px; max-height:250px; overflow-y:auto; white-space:pre-wrap; color:var(--text2); font-family:'SF Mono',Menlo,monospace; line-height:1.5; }
+.logs .hl-err { color:var(--red); }
+.logs .hl-warn { color:var(--yellow); }
+.logs .hl-ok { color:var(--green); }
+.logs .hl-dim { color:var(--text3); }
+.filter-bar { display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap; align-items:center; }
+.filter-bar input { flex:1; min-width:150px; }
+.preset-bar { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+.toast { position:fixed; top:20px; right:20px; padding:12px 20px; border-radius:8px; font-size:13px; z-index:999; animation:fadeIn .3s; }
+.toast-ok { background:#238636; color:#fff; }
+.toast-err { background:#da3633; color:#fff; }
+.toast-info { background:var(--accent); color:#fff; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(-10px);} to{opacity:1;transform:translateY(0);} }
+::-webkit-scrollbar { width:6px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+.timestamp { font-size:10px; color:var(--text3); }
+</style>
+</head>
+<body>
+<div class="header">
+  <span class="logo">oc-go-cc</span>
+  <span class="status" id="hdr-status"><span class="dot dot-green"></span>检测中...</span>
+  <span class="info"><span id="hdr-uptime">--</span> &middot; <code style="color:var(--accent)">127.0.0.1:3456</code></span>
+  <span class="header-actions">
+    <button class="btn btn-accent" onclick="testConnectivity()">连通测试</button>
+    <button class="btn" id="btn-refresh" onclick="toggleRefresh()">⏸ 暂停刷新</button>
+    <button class="btn" onclick="toggleTheme()" id="btn-theme">☀ 浅色</button>
+  </span>
+</div>
+
+<div class="metrics-row" id="metrics-row"></div>
+
+<div class="main-grid">
+  <div class="card">
+    <h3>熔断器状态 <span class="badge" id="circuit-health">--</span></h3>
+    <div id="circuits"></div>
+    <button class="btn btn-sm btn-red" style="margin-top:8px" onclick="resetCircuits()">重置所有熔断器</button>
+  </div>
+  <div class="card">
+    <h3>模型用量</h3>
+    <div id="usage-chart"></div>
+  </div>
+  <div class="card">
+    <h3>请求时间线 <span class="badge" id="timeline-count">0</span></h3>
+    <div class="timeline" id="timeline"></div>
+  </div>
+  <div class="card">
+    <h3>延迟趋势 <span class="badge">最近60次</span></h3>
+    <canvas id="latency-canvas"></canvas>
+  </div>
+</div>
+
+<div class="card full" style="margin-bottom:16px">
+  <h3>模型配置</h3>
+  <div class="preset-bar">
+    <span style="font-size:12px;color:var(--text2)">预设:</span>
+    <select id="preset-select" onchange="onPresetSelect()"><option value="">-- 选择预设 --</option></select>
+    <button class="btn btn-sm btn-accent" onclick="loadPreset()">加载</button>
+    <button class="btn btn-sm" onclick="savePreset()">另存为...</button>
+    <button class="btn btn-sm btn-red" onclick="deletePreset()">删除</button>
+    <span style="font-size:10px;color:var(--text3);margin-left:4px" id="preset-name-display"></span>
+  </div>
+  <div id="config-rows"></div>
+  <div style="margin-top:10px;display:flex;gap:8px">
+    <button class="btn btn-accent" onclick="saveConfig()">保存并重启代理</button>
+    <button class="btn" onclick="location.reload()">刷新</button>
+  </div>
+</div>
+
+<div class="card full">
+  <h3>日志</h3>
+  <div class="filter-bar">
+    <input type="text" id="log-filter" placeholder="搜索关键字..." oninput="renderLogs()">
+    <button class="btn btn-sm" onclick="setLogFilter('all')">全部</button>
+    <button class="btn btn-sm" onclick="setLogFilter('err')" style="color:var(--red)">错误</button>
+    <button class="btn btn-sm" onclick="setLogFilter('warn')" style="color:var(--yellow)">警告</button>
+    <button class="btn btn-sm" onclick="setLogFilter('ok')" style="color:var(--green)">成功</button>
+    <button class="btn btn-sm" onclick="toggleLogAuto()" id="btn-log-auto">自动跟随</button>
+  </div>
+  <div class="logs" id="logs">加载中...</div>
+</div>
+
+<div style="text-align:center;padding:16px;font-size:11px;color:var(--text3)">
+  oc-go-cc Dashboard v2 &middot; <span id="footer-time"></span>
+</div>
+
+<script>
+var REFRESH_INTERVAL = 5000;
+var refreshTimer = null;
+var refreshPaused = false;
+var prevMetrics = {};
+var latencyHistory = [];
+var logFilterType = 'all';
+var logAutoFollow = true;
+var currentConfig = {};
+var availableModels = [];
+var currentPreset = '';
+
+function $(id) { return document.getElementById(id); }
+
+function toast(msg, cls) {
+  var t = document.createElement('div');
+  t.className = 'toast toast-' + (cls || 'info');
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(function(){ t.remove(); }, 2500);
+}
+
+// ── Data fetching ──
+async function fetchAll() {
+  try {
+    var r1 = await fetch('/api/health'); var health = r1.ok ? await r1.json() : null;
+    var r2 = await fetch('/api/timeline?n=30'); var tl = r2.ok ? await r2.json() : [];
+    var r3 = await fetch('/api/config'); var cfg = r3.ok ? await r3.json() : {};
+    var r4 = await fetch('/api/logs'); var logs = r4.ok ? await r4.json() : {};
+    var r5 = await fetch('/api/presets'); var presets = r5.ok ? await r5.json() : [];
+
+    if (health) {
+      renderHeader(health);
+      renderMetrics(health.metrics || {});
+      renderCircuits(health.circuit_breakers || {});
+      renderUsage(health.models || {});
+    }
+    renderTimeline(tl || []);
+    renderLatencyTrend();
+    if (cfg.config) { currentConfig = cfg.config; availableModels = cfg.models; renderConfigRows(); }
+    if (logs.logs !== undefined) { window._logs = logs.logs; renderLogs(); }
+    renderPresets(presets || []);
+    checkAlerts(health ? health.metrics || {} : {}, health ? health.circuit_breakers || {} : {});
+    $('footer-time').textContent = new Date().toLocaleTimeString('zh-CN');
+  } catch(e) { console.error(e); }
+}
+
+// ── Header ──
+function renderHeader(health) {
+  var el = $('hdr-status');
+  if (health.status === 'ok') {
+    el.innerHTML = '<span class="dot dot-green"></span>运行中 (PID ' + (health._pid || '--') + ')';
+  } else {
+    el.innerHTML = '<span class="dot dot-red"></span>异常';
+  }
+}
+
+// ── Metrics ──
+function renderMetrics(m) {
+  var now = m;
+  var prev = prevMetrics || {};
+  var items = [
+    { key:'requests_received', label:'总请求', fmt:function(v){return v;} },
+    { key:'requests_success', label:'成功', fmt:function(v){return v + ' <span style="font-size:11px;color:var(--text2)">' + (now.requests_received>0?Math.round(v/now.requests_received*100)+'%':'-') + '</span>';} },
+    { key:'requests_failed', label:'失败', fmt:function(v){return v;} },
+    { key:'p95_latency_ms', label:'P95延迟', fmt:function(v){return (v/1000).toFixed(1)+'s';} },
+    { key:'p99_latency_ms', label:'P99延迟', fmt:function(v){return (v/1000).toFixed(1)+'s';} },
+    { key:'requests_streamed', label:'流式请求', fmt:function(v){return v + ' / ' + (now.upstream_calls||0) + ' 上游';} }
+  ];
+  var html = '';
+  for (var i=0;i<items.length;i++) {
+    var it = items[i];
+    var val = now[it.key] || 0;
+    var diff = '';
+    if (prev[it.key] !== undefined) {
+      var d = val - prev[it.key];
+      if (d > 0) diff = ' <span class="trend-up">+'+d+'</span>';
+      else if (d < 0) diff = ' <span class="trend-down">'+d+'</span>';
+      else diff = ' <span class="trend-flat">→</span>';
+    }
+    html += '<div class="metric-card"><div class="value">'+it.fmt(val)+'</div><div class="label">'+it.label+'</div><div class="trend">'+diff+'</div></div>';
+  }
+  $('metrics-row').innerHTML = html;
+  prevMetrics = JSON.parse(JSON.stringify(now));
+}
+
+// ── Circuits ──
+var lastCircuitState = {};
+function renderCircuits(cb) {
+  var html = '';
+  var keys = Object.keys(cb);
+  var healthy = 0;
+  for (var i=0;i<keys.length;i++) {
+    var k = keys[i];
+    var st = cb[k];
+    var cls = st === 'closed' ? 'state-closed' : st === 'open' ? 'state-open' : 'state-half';
+    var txt = st === 'closed' ? '正常' : st === 'open' ? '熔断' : '半开';
+    var dotCls = st === 'closed' ? 'dot-green' : st === 'open' ? 'dot-red' : 'dot-yellow';
+    if (st === 'closed') healthy++;
+    html += '<div class="circuit-row"><span class="dot '+dotCls+'"></span><span class="name">'+k+'</span><span class="state '+cls+'">'+txt+'</span></div>';
+  }
+  if (!keys.length) html = '<div style="font-size:12px;color:var(--text2);padding:8px 0">无熔断器数据</div>';
+  $('circuits').innerHTML = html;
+  $('circuit-health').textContent = keys.length ? Math.round(healthy/keys.length*100)+'% 健康' : '--';
+
+  // Check for new circuit trip alerts
+  for (var i=0;i<keys.length;i++) {
+    var k = keys[i];
+    var st = cb[k];
+    if (lastCircuitState[k] === 'closed' && st === 'open') {
+      showAlert('熔断器打开', '模型 ' + k + ' 已熔断，将自动切换到备用模型。');
+    }
+  }
+  lastCircuitState = JSON.parse(JSON.stringify(cb));
+}
+
+// ── Model usage bars ──
+function renderUsage(models) {
+  var html = '';
+  var keys = Object.keys(models);
+  var maxv = 0;
+  for (var i=0;i<keys.length;i++) { if (models[keys[i]] > maxv) maxv = models[keys[i]]; }
+  if (!keys.length) { $('usage-chart').innerHTML = '<div style="font-size:12px;color:var(--text2)">暂无数据</div>'; return; }
+  var colors = ['#58a6ff','#3fb950','#d29922','#a371f7','#f85149','#79c0ff','#56d364','#e3b341'];
+  for (var i=0;i<keys.length;i++) {
+    var model = keys[i];
+    var count = models[model];
+    var pct = maxv > 0 ? Math.round(count/maxv*100) : 0;
+    html += '<div class="usage-bar-wrap"><span class="label">'+model+'</span><div class="bar-bg"><div class="bar-fill" style="width:'+pct+'%;background:'+(colors[i%colors.length])+'"></div></div><span class="count">'+count+'次</span></div>';
+  }
+  $('usage-chart').innerHTML = html;
+}
+
+// ── Timeline ──
+function renderTimeline(items) {
+  $('timeline-count').textContent = items.length;
+  var html = '';
+  for (var i=0;i<items.length;i++) {
+    var it = items[i];
+    var statusIcon = it.status === 'success' ? '<span class="status-ok">&#9679;</span>' :
+                     it.status === 'error' ? '<span class="status-err">&#9679;</span>' :
+                     '<span class="status-warn">&#9679;</span>';
+    var timeStr = it.time ? it.time.substring(11,19) : '--:--:--';
+    html += '<div class="timeline-item"><span class="timeline-time">'+timeStr+'</span>'+statusIcon+'<span class="timeline-model">'+it.model+'</span><span style="font-size:10px;color:var(--text3)">'+(it.scenario||'')+'</span><span class="timeline-latency">'+(it.latency||'--')+'</span></div>';
+  }
+  if (!items.length) html = '<div style="font-size:12px;color:var(--text2);padding:12px">暂无请求记录</div>';
+  $('timeline').innerHTML = html;
+}
+
+// ── Latency trend canvas ──
+function renderLatencyTrend() {
+  var canvas = $('latency-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var dpr = window.devicePixelRatio || 1;
+  var rect = canvas.getBoundingClientRect();
+  var w = rect.width * dpr;
+  var h = 160 * dpr;
+  canvas.width = w; canvas.height = h;
+  var data = latencyHistory.slice(-60);
+  if (!data.length) { ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text2'); ctx.font='12px sans-serif'; ctx.fillText('暂无延迟数据',20,50); return; }
+  var maxv = Math.max.apply(null, data) || 1;
+  var p95 = percentile(data, 95);
+  var pad = 8*dpr;
+  var pw = w - pad*2, ph = h - pad*2;
+  // Grid lines
+  ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue('--border');
+  ctx.lineWidth = 0.5 * dpr;
+  for (var g=0;g<3;g++) {
+    var gy = pad + ph * (g/3);
+    ctx.beginPath(); ctx.moveTo(pad,gy); ctx.lineTo(w-pad,gy); ctx.stroke();
+  }
+  // P95 line
+  var p95y = pad + ph * (1 - p95/maxv);
+  ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue('--red');
+  ctx.setLineDash([3*dpr,3*dpr]);
+  ctx.lineWidth = 1*dpr;
+  ctx.beginPath(); ctx.moveTo(pad,p95y); ctx.lineTo(w-pad,p95y); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--red');
+  ctx.font = (9*dpr)+'px sans-serif';
+  ctx.fillText('P95='+(p95/1000).toFixed(1)+'s', pad, p95y-2*dpr);
+  // Line
+  if (data.length > 1) {
+    var stepX = pw / (data.length-1);
+    ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue('--accent');
+    ctx.lineWidth = 1.5*dpr;
+    ctx.beginPath();
+    for (var i=0;i<data.length;i++) {
+      var x = pad + i*stepX;
+      var y = pad + ph * (1 - data[i]/maxv);
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    // Dot on last
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--accent');
+    ctx.beginPath();
+    ctx.arc(pad+(data.length-1)*stepX, pad+ph*(1-data[data.length-1]/maxv), 3*dpr, 0, Math.PI*2);
+    ctx.fill();
+  }
+  // Labels
+  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text3');
+  ctx.font = (9*dpr)+'px sans-serif';
+  ctx.fillText((maxv/1000).toFixed(1)+'s', w-pad-20*dpr, pad+10*dpr);
+  ctx.fillText('0', pad, h-pad-2*dpr);
+}
+
+function percentile(arr, p) {
+  if (!arr.length) return 0;
+  var sorted = arr.slice().sort(function(a,b){return a-b;});
+  var idx = (p/100) * (sorted.length-1);
+  var lo = Math.floor(idx), hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi]-sorted[lo])*(idx-lo);
+}
+
+// ── Config rows ──
+function renderConfigRows() {
+  var container = $('config-rows');
+  if (!currentConfig.models) return;
+  var labels = { default:'默认模型', think:'思考推理', complex:'复杂任务', long_context:'长上下文', background:'后台任务', fast:'快速响应' };
+  var hints = { default:'未匹配走此模型', think:'think/plan 关键词', complex:'architect/refactor 关键词', long_context:'>80K token 触发', background:'文件读取等简单操作', fast:'流式轻量模型' };
+  var keys = Object.keys(currentConfig.models);
+  var html = '';
+  for (var i=0;i<keys.length;i++) {
+    var k = keys[i];
+    var cfg = currentConfig.models[k];
+    var opts = '';
+    for (var j=0;j<availableModels.length;j++) {
+      var m = availableModels[j];
+      opts += '<option value="'+m+'"'+(m===cfg.model_id?' selected':'')+'>'+m+'</option>';
+    }
+    html += '<div class="config-row"><label>'+(labels[k]||k)+'</label><select data-scenario="'+k+'">'+opts+'</select><span style="font-size:10px;color:var(--text3)">'+(hints[k]||'')+'</span></div>';
+  }
+  container.innerHTML = html;
+}
+
+// ── Config save ──
+async function saveConfig() {
+  var selects = document.querySelectorAll('select[data-scenario]');
+  var models = currentConfig.models || {};
+  for (var i=0;i<selects.length;i++) {
+    var s = selects[i];
+    if (models[s.dataset.scenario]) models[s.dataset.scenario].model_id = s.value;
+  }
+  try {
+    var r = await fetch('/api/save', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({models:currentConfig.models}) });
+    var d = await r.json();
+    if (d.ok) { toast('配置已保存，代理已重启！','ok'); setTimeout(fetchAll,1500); }
+    else toast('保存失败: '+d.error,'err');
+  } catch(e) { toast('网络错误','err'); }
+}
+
+// ── Presets ──
+function renderPresets(ps) {
+  var sel = $('preset-select');
+  sel.innerHTML = '<option value="">-- 选择预设 --</option>';
+  for (var i=0;i<ps.length;i++) {
+    sel.innerHTML += '<option value="'+ps[i]+'">'+ps[i]+'</option>';
+  }
+}
+
+async function loadPreset() {
+  var name = $('preset-select').value;
+  if (!name) return;
+  try {
+    var r = await fetch('/api/presets/load?name='+encodeURIComponent(name), {method:'POST'});
+    var d = await r.json();
+    if (d.ok) { toast('已加载预设: '+name,'ok'); currentPreset = name; $('preset-name-display').textContent = '当前: '+name; setTimeout(fetchAll,1500); }
+    else toast('加载失败: '+d.error,'err');
+  } catch(e) { toast('网络错误','err'); }
+}
+
+async function savePreset() {
+  var name = prompt('预设名称:');
+  if (!name) return;
+  try {
+    var r = await fetch('/api/presets', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name}) });
+    var d = await r.json();
+    if (d.ok) { toast('预设已保存: '+name,'ok'); fetchAll(); }
+    else toast('保存失败: '+d.error,'err');
+  } catch(e) { toast('网络错误','err'); }
+}
+
+async function deletePreset() {
+  var name = $('preset-select').value;
+  if (!name) return;
+  if (!confirm('确认删除预设 "'+name+'"?')) return;
+  try {
+    var r = await fetch('/api/presets?name='+encodeURIComponent(name), {method:'DELETE'});
+    var d = await r.json();
+    if (d.ok) { toast('已删除: '+name,'ok'); currentPreset = ''; $('preset-name-display').textContent = ''; fetchAll(); }
+    else toast('删除失败: '+d.error,'err');
+  } catch(e) { toast('网络错误','err'); }
+}
+
+// ── Logs ──
+function setLogFilter(f) { logFilterType = f; renderLogs(); }
+function toggleLogAuto() {
+  logAutoFollow = !logAutoFollow;
+  $('btn-log-auto').textContent = logAutoFollow ? '自动跟随 ✓' : '自动跟随';
+  if (logAutoFollow) { var el=$('logs'); el.scrollTop = el.scrollHeight; }
+}
+
+function renderLogs() {
+  var raw = window._logs || '';
+  var filter = ($('log-filter').value || '').toLowerCase();
+  var lines = raw.split('\n');
+  var html = '';
+  for (var i=0;i<lines.length;i++) {
+    var line = lines[i];
+    if (!line) continue;
+    var cls = 'hl-dim';
+    if (/ERROR|error|level=ERROR/.test(line)) cls = 'hl-err';
+    else if (/WARN|level=WARN/.test(line)) cls = 'hl-warn';
+    else if (/completed|succeeded/.test(line)) cls = 'hl-ok';
+
+    if (logFilterType === 'err' && cls !== 'hl-err') continue;
+    if (logFilterType === 'warn' && cls !== 'hl-warn') continue;
+    if (logFilterType === 'ok' && cls !== 'hl-ok') continue;
+    if (filter && line.toLowerCase().indexOf(filter) === -1) continue;
+
+    html += '<span class="'+cls+'">'+escHtml(line)+'</span>\n';
+  }
+  $('logs').innerHTML = html || '无匹配日志';
+  if (logAutoFollow) { var el=$('logs'); setTimeout(function(){el.scrollTop=el.scrollHeight;},50); }
+}
+
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── Theme ──
+function toggleTheme() {
+  document.body.classList.toggle('light');
+  $('btn-theme').textContent = document.body.classList.contains('light') ? '🌙 深色' : '☀ 浅色';
+  renderLatencyTrend();
+}
+
+// ── Refresh control ──
+function toggleRefresh() {
+  refreshPaused = !refreshPaused;
+  $('btn-refresh').textContent = refreshPaused ? '▶ 恢复刷新' : '⏸ 暂停刷新';
+}
+
+// ── Connectivity test ──
+async function testConnectivity() {
+  toast('测试中...', 'info');
+  try {
+    var r = await fetch('/api/test', {method:'POST'});
+    var d = await r.json();
+    if (d.ok) toast('连通正常! 延迟: '+d.latency+' 模型: '+d.model, 'ok');
+    else toast('测试失败: '+d.error, 'err');
+  } catch(e) { toast('测试失败: 网络错误','err'); }
+}
+
+// ── Circuit reset ──
+async function resetCircuits() {
+  if (!confirm('将重启代理以重置所有熔断器，确认?')) return;
+  try {
+    var r = await fetch('/api/reset-circuit', {method:'POST'});
+    var d = await r.json();
+    if (d.ok) { toast('熔断器已重置！','ok'); setTimeout(fetchAll,2000); }
+    else toast('重置失败: '+d.error,'err');
+  } catch(e) { toast('网络错误','err'); }
+}
+
+// ── Alerts ──
+var alertSent = {};
+function checkAlerts(metrics, circuits) {
+  var keys = Object.keys(circuits);
+  for (var i=0;i<keys.length;i++) {
+    var k = keys[i];
+    if (circuits[k] === 'open' && !alertSent[k]) {
+      showAlert('熔断器打开', '模型 '+k+' 已熔断，将自动切换到备用模型。');
+      alertSent[k] = true;
+    }
+    if (circuits[k] === 'closed') alertSent[k] = false;
+  }
+  var errRate = metrics.requests_received > 0 ? metrics.requests_failed / metrics.requests_received : 0;
+  if (errRate > 0.5 && metrics.requests_received > 5 && !alertSent['_high_err']) {
+    showAlert('高错误率', '错误率超过 50% ('+metrics.requests_failed+'/'+metrics.requests_received+')，请检查代理状态。');
+    alertSent['_high_err'] = true;
+  }
+  if (errRate <= 0.5) alertSent['_high_err'] = false;
+}
+
+function showAlert(title, body) {
+  if (Notification.permission === 'granted') {
+    new Notification(title, {body:body, icon:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="50" fill="%23f85149"/></svg>'});
+  } else if (Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+// ── Init ──
+var START_TIME = Math.floor(Date.now()/1000);
+
+function startRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(function(){
+    if (!refreshPaused) fetchAll();
+  }, REFRESH_INTERVAL);
+}
+
+function collectLatency() {
+  fetch('/api/timeline?n=60').then(function(r){return r.json();}).then(function(tl){
+    latencyHistory = [];
+    for (var i=0;i<(tl||[]).length;i++) {
+      var l = tl[i].latency_ms;
+      if (l > 0) latencyHistory.push(l);
+    }
+    latencyHistory.reverse();
+    renderLatencyTrend();
+  });
+}
+
+function formatDuration(s) {
+  if (s<60) return s+'s';
+  if (s<3600) return Math.floor(s/60)+'m '+s%60+'s';
+  return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';
+}
+
+Notification.requestPermission();
+fetchAll().then(function(){ collectLatency(); });
+startRefresh();
+setInterval(function(){
+  var elapsed = Math.floor((Date.now()/1000) - START_TIME);
+  $('hdr-uptime').textContent = '运行 '+formatDuration(elapsed);
+  collectLatency();
+}, 10000);
+</script>
+</body>
+</html>"""
+
+
+# ── BACKEND ──
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def json(self, code, data):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def html_page(self, code, html):
+        body = html.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        p = urlparse(self.path).path
+        q = parse_qs(urlparse(self.path).query)
+        if p == "/" or p == "/index.html":
+            self.html_page(200, HTML)
+        elif p == "/api/health":
+            self.json(200, proxy_health())
+        elif p == "/api/timeline":
+            n = int(q.get("n", [30])[0])
+            self.json(200, parse_timeline(n))
+        elif p == "/api/config":
+            try:
+                with open(CONFIG_PATH) as f:
+                    config = json.load(f)
+            except Exception:
+                config = {"models": {}}
+            self.json(200, {"config": config, "models": get_models()})
+        elif p == "/api/logs":
+            self.json(200, {"logs": read_logs()})
+        elif p == "/api/presets":
+            self.json(200, list_presets())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        p = urlparse(self.path).path
+        q = parse_qs(urlparse(self.path).query)
+        if p == "/api/save":
+            self.handle_save()
+        elif p == "/api/test":
+            self.handle_test()
+        elif p == "/api/reset-circuit":
+            self.handle_reset()
+        elif p == "/api/presets":
+            self.handle_save_preset()
+        elif p == "/api/presets/load":
+            name = q.get("name", [""])[0]
+            self.handle_load_preset(name)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_DELETE(self):
+        p = urlparse(self.path).path
+        q = parse_qs(urlparse(self.path).query)
+        if p == "/api/presets":
+            name = q.get("name", [""])[0]
+            self.handle_delete_preset(name)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def read_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            return json.loads(self.rfile.read(length))
+        return {}
+
+    def handle_save(self):
+        try:
+            data = self.read_body()
+            with open(CONFIG_PATH) as f:
+                config = json.load(f)
+            if "models" in data:
+                for scenario, cfg in data["models"].items():
+                    if scenario in config.get("models", {}):
+                        config["models"][scenario]["model_id"] = cfg.get(
+                            "model_id", config["models"][scenario]["model_id"]
+                        )
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(config, f, indent=2)
+            restart_proxy()
+            self.json(200, {"ok": True})
+        except Exception as e:
+            self.json(500, {"ok": False, "error": str(e)})
+
+    def handle_test(self):
+        try:
+            import urllib.request
+            data = json.dumps({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 5,
+                "messages": [{"role": "user", "content": "hi"}]
+            }).encode()
+            req = urllib.request.Request(PROXY_URL, data=data)
+            req.add_header("Content-Type", "application/json")
+            req.add_header("x-api-key", "unused")
+            req.add_header("anthropic-version", "2023-06-01")
+            t0 = time.time()
+            resp = urllib.request.urlopen(req, timeout=15)
+            result = json.loads(resp.read())
+            latency = f"{(time.time()-t0)*1000:.0f}ms"
+            model = result.get("model", "unknown")
+            self.json(200, {"ok": True, "latency": latency, "model": model})
+        except Exception as e:
+            self.json(200, {"ok": False, "error": str(e)[:100]})
+
+    def handle_reset(self):
+        try:
+            restart_proxy()
+            self.json(200, {"ok": True})
+        except Exception as e:
+            self.json(500, {"ok": False, "error": str(e)})
+
+    def handle_save_preset(self):
+        try:
+            data = self.read_body()
+            name = data.get("name", "").strip()
+            if not name:
+                self.json(400, {"ok": False, "error": "名称不能为空"})
+                return
+            # Read current config
+            with open(CONFIG_PATH) as f:
+                config = json.load(f)
+            # Sanitize name for filename
+            safe = re.sub(r"[^\w\-]", "_", name)
+            path = PRESETS_DIR / f"{safe}.json"
+            with open(path, "w") as f:
+                json.dump(config, f, indent=2)
+            self.json(200, {"ok": True})
+        except Exception as e:
+            self.json(500, {"ok": False, "error": str(e)})
+
+    def handle_load_preset(self, name):
+        try:
+            safe = re.sub(r"[^\w\-]", "_", name)
+            path = PRESETS_DIR / f"{safe}.json"
+            if not path.exists():
+                self.json(404, {"ok": False, "error": "预设不存在"})
+                return
+            with open(path) as f:
+                config = json.load(f)
+            # Preserve API key from current config
+            try:
+                with open(CONFIG_PATH) as f:
+                    cur = json.load(f)
+                config["api_key"] = cur.get("api_key", config.get("api_key", ""))
+            except Exception:
+                pass
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(config, f, indent=2)
+            restart_proxy()
+            self.json(200, {"ok": True})
+        except Exception as e:
+            self.json(500, {"ok": False, "error": str(e)})
+
+    def handle_delete_preset(self, name):
+        try:
+            safe = re.sub(r"[^\w\-]", "_", name)
+            path = PRESETS_DIR / f"{safe}.json"
+            if not path.exists():
+                self.json(404, {"ok": False, "error": "预设不存在"})
+                return
+            path.unlink()
+            self.json(200, {"ok": True})
+        except Exception as e:
+            self.json(500, {"ok": False, "error": str(e)})
+
+
+# ── Helper functions ──
+
+def proxy_health():
+    """Get health from proxy + PID from status."""
+    result = {"status": "unknown", "circuit_breakers": {}, "metrics": {}, "models": {}, "_pid": None}
+    try:
+        import urllib.request
+        req = urllib.request.Request(HEALTH_URL)
+        resp = urllib.request.urlopen(req, timeout=3)
+        data = json.loads(resp.read())
+        result.update(data)
+    except Exception:
+        result["status"] = "offline"
+    # Get PID
+    try:
+        env = os.environ.copy()
+        out = subprocess.run([str(BINARY), "status"], capture_output=True, text=True, timeout=5, env=env)
+        for line in out.stdout.split("\n"):
+            if "PID" in line:
+                result["_pid"] = line.split()[-1].strip().rstrip(")")
+                break
+    except Exception:
+        pass
+    return result
+
+
+def parse_timeline(n=30):
+    """Parse log file to build a request timeline."""
+    items = []
+    try:
+        text = LOG_PATH.read_text()
+        lines = text.strip().split("\n")
+        for line in reversed(lines):
+            if len(items) >= n:
+                break
+            # Extract timestamp and everything after "msg="
+            match = re.search(r"time=([\d\-T:.+\-]+)\s+level=\w+\s+", line)
+            if not match:
+                continue
+            timestamp = match.group(1)
+            rest = line[match.end():]
+
+            if "request completed" in rest:
+                m_model = re.search(r"model=(\S+)", rest)
+                m_lat = re.search(r"latency=([\d.]+)s", rest)
+                items.append({
+                    "time": timestamp, "status": "success",
+                    "model": m_model.group(1) if m_model else "unknown",
+                    "scenario": "", "latency": m_lat.group(1)+"s" if m_lat else "--",
+                    "latency_ms": int(float(m_lat.group(1))*1000) if m_lat else 0
+                })
+            elif "request error" in rest:
+                m_status = re.search(r"status=(\d+)", rest)
+                items.append({
+                    "time": timestamp, "status": "error",
+                    "model": "system", "scenario": "",
+                    "latency": m_status.group(1) if m_status else "err", "latency_ms": 0
+                })
+            elif "model failed" in rest and "trying fallback" in rest:
+                m_model = re.search(r"model=(\S+)", rest)
+                items.append({
+                    "time": timestamp, "status": "error",
+                    "model": m_model.group(1) if m_model else "unknown",
+                    "scenario": "fallback", "latency": "err", "latency_ms": 0
+                })
+    except Exception:
+        pass
+    return items
+
+
+def get_models():
+    """Get available model IDs."""
+    try:
+        env = os.environ.copy()
+        result = subprocess.run(
+            [str(BINARY), "models"], capture_output=True, text=True, timeout=10, env=env
+        )
+        models = []
+        for line in result.stdout.split("\n"):
+            line = line.strip()
+            if line and not line.startswith("─") and not line.startswith("Model") \
+               and not line.startswith("Available") and not line.startswith("Use these"):
+                parts = line.split()
+                if parts and not parts[0].startswith("─"):
+                    models.append(parts[0])
+        return models if models else [
+            "deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.6",
+            "kimi-k2.5", "glm-5.1", "glm-5", "qwen3.6-plus"
+        ]
+    except Exception:
+        return ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.6"]
+
+
+def read_logs():
+    """Read last 100 lines of log."""
+    try:
+        text = LOG_PATH.read_text()
+        lines = text.strip().split("\n")
+        return "\n".join(lines[-100:])
+    except Exception:
+        return "暂无日志"
+
+
+def list_presets():
+    """List preset names."""
+    try:
+        PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+        names = []
+        for f in sorted(PRESETS_DIR.glob("*.json")):
+            names.append(f.stem)
+        return names
+    except Exception:
+        return []
+
+
+def restart_proxy():
+    """Restart the oc-go-cc proxy."""
+    env = os.environ.copy()
+    subprocess.run(["pkill", "-f", "oc-go-cc serve"], capture_output=True, timeout=5)
+    time.sleep(1)
+    subprocess.run([str(BINARY), "stop"], capture_output=True, env=env, timeout=5)
+    time.sleep(0.5)
+    subprocess.run([str(BINARY), "serve", "-b"], capture_output=True, env=env, timeout=5)
+
+
+# ── Daemonize ──
+
+def daemonize():
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+    os.setsid()
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+    os.chdir("/")
+    os.umask(0)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+
+
+# ── Main ──
+
+def main():
+    global START_TIME
+    import argparse
+    parser = argparse.ArgumentParser(description="oc-go-cc Web Dashboard v2")
+    parser.add_argument("--port", type=int, default=3457)
+    parser.add_argument("-b", "--background", action="store_true")
+    parser.add_argument("--stop", action="store_true")
+    args = parser.parse_args()
+
+    if args.stop:
+        if PID_FILE.exists():
+            try:
+                pid = int(PID_FILE.read_text().strip())
+                os.kill(pid, signal.SIGTERM)
+                PID_FILE.unlink()
+                print("Dashboard stopped.")
+            except Exception as e:
+                print(f"Failed: {e}")
+        else:
+            print("Not running.")
+        sys.exit(0)
+
+    if args.background:
+        daemonize()
+
+    server = HTTPServer((HOST, args.port), Handler)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    if not args.background:
+        print(f"oc-go-cc Dashboard v2 → http://{HOST}:{args.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        server.server_close()
+        PID_FILE.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()
+
