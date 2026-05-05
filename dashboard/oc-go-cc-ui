@@ -619,9 +619,9 @@ function renderUsageStats(usage) {
 }
 
 function formatTokens(n) {
-  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n/1000).toFixed(1) + 'K';
-  return n + '';
+  if (n >= 100000000) return (n/100000000).toFixed(1) + '亿';
+  if (n >= 10000) return (n/10000).toFixed(1) + '万';
+  return n.toLocaleString();
 }
 
 // ── Theme ──
