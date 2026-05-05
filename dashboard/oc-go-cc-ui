@@ -14,6 +14,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 CONFIG_PATH = Path.home() / ".config/oc-go-cc/config.json"
+KEYS_PATH = Path.home() / ".config/oc-go-cc/keys.json"
 PRESETS_DIR = Path.home() / ".config/oc-go-cc/presets"
 BINARY = Path.home() / ".local/bin/oc-go-cc"
 LOG_PATH = Path.home() / ".config/oc-go-cc/oc-go-cc.log"
@@ -26,6 +27,10 @@ START_TIME = time.time()
 
 # --- Last metrics for trend comparison ---
 _last_metrics = {}
+# --- Key rotation state ---
+_key_rotate_lock = threading.Lock()
+_last_log_size = 0
+_quota_fail_count = 0
 
 # --- HTML TEMPLATE ---
 HTML = r"""<!DOCTYPE html>
@@ -181,6 +186,22 @@ input { padding:5px 8px; background:var(--input-bg); color:var(--text); border:1
   </div>
 </div>
 
+<div class="card full" style="margin-bottom:16px">
+  <h3>API Key 管理 <span class="badge" id="keys-count">0</span>
+    <span style="font-size:10px;color:var(--text3);margin-left:8px">支持多个 Key 自动切换</span>
+  </h3>
+  <div id="keys-list" style="margin-bottom:8px"></div>
+  <div class="filter-bar" style="margin-bottom:4px">
+    <input type="password" id="key-input" placeholder="输入 OpenCode Go API Key (sk-opencode-...)" style="flex:1">
+    <input type="text" id="key-label" placeholder="标签 (可选)" style="width:130px">
+    <button class="btn btn-accent btn-sm" onclick="addKey()">添加</button>
+  </div>
+  <div style="font-size:11px;color:var(--text3)">
+    自动故障转移：当检测到 429/余额不足 错误时，自动切换到下一个可用 Key。
+    <span id="failover-count" style="display:none">已自动切换 <strong style="color:var(--yellow)">0</strong> 次</span>
+  </div>
+</div>
+
 <div class="card full">
   <h3>日志</h3>
   <div class="filter-bar">
@@ -228,6 +249,7 @@ async function fetchAll() {
     var r3 = await fetch('/api/config'); var cfg = r3.ok ? await r3.json() : {};
     var r4 = await fetch('/api/logs'); var logs = r4.ok ? await r4.json() : {};
     var r5 = await fetch('/api/presets'); var presets = r5.ok ? await r5.json() : [];
+    var r6 = await fetch('/api/keys'); var keysResp = r6.ok ? await r6.json() : {};
 
     if (health) {
       renderHeader(health);
@@ -240,6 +262,7 @@ async function fetchAll() {
     if (cfg.config) { currentConfig = cfg.config; availableModels = cfg.models; renderConfigRows(); }
     if (logs.logs !== undefined) { window._logs = logs.logs; renderLogs(); }
     renderPresets(presets || []);
+    renderKeys(keysResp.keys || [], keysResp.active_index);
     checkAlerts(health ? health.metrics || {} : {}, health ? health.circuit_breakers || {} : {});
     $('footer-time').textContent = new Date().toLocaleTimeString('zh-CN');
   } catch(e) { console.error(e); }
@@ -585,10 +608,72 @@ function checkAlerts(metrics, circuits) {
 
 function showAlert(title, body) {
   if (Notification.permission === 'granted') {
-    new Notification(title, {body:body, icon:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="50" fill="%23f85149"/></svg>'});
+    new Notification(title, {body:body});
   } else if (Notification.permission === 'default') {
     Notification.requestPermission();
   }
+}
+
+// ── Key management ──
+var keysData = [];
+
+function renderKeys(keys, activeIdx) {
+  keysData = keys || [];
+  $('keys-count').textContent = keysData.length;
+  var active = activeIdx !== undefined ? activeIdx : -1;
+  var html = '';
+  for (var i=0;i<keysData.length;i++) {
+    var k = keysData[i];
+    var masked = k.key.substring(0,10) + '...' + k.key.substring(k.key.length-6);
+    var isActive = i === active;
+    var icon = isActive ? '<span class="dot dot-green" title="当前使用"></span>' : '<span class="dot" style="background:var(--text3)" title="备用"></span>';
+    var label = k.label || ('Key '+(i+1));
+    var exhausted = k.exhausted ? ' <span class="state-state-open" style="font-size:10px">已耗尽</span>' : '';
+    html += '<div class="circuit-row">'+icon+'<span class="name" style="font-size:12px">'+escHtml(label)+'</span><code style="font-size:11px;color:var(--text2)">'+masked+'</code>'+exhausted;
+    if (!isActive && !k.exhausted) html += '<button class="btn btn-sm" style="margin-left:8px" onclick="activateKey('+i+')">启用</button>';
+    html += '<button class="btn btn-sm btn-red" style="margin-left:4px" onclick="deleteKey('+i+')">删除</button>';
+    html += '</div>';
+  }
+  if (!keysData.length) html = '<div style="font-size:12px;color:var(--text2);padding:8px 0">暂无 API Key，请添加</div>';
+  $('keys-list').innerHTML = html;
+
+  // Show failover count
+  var fc = 0;
+  for (var i=0;i<keysData.length;i++) { if (keysData[i].exhausted) fc++; }
+  var el = $('failover-count');
+  if (fc > 0) { el.style.display = ''; el.innerHTML = '已自动切换<strong style="color:var(--yellow)">'+fc+'</strong>个 Key'; }
+  else el.style.display = 'none';
+}
+
+async function addKey() {
+  var key = $('key-input').value.trim();
+  var label = $('key-label').value.trim();
+  if (!key) { toast('请输入 API Key','err'); return; }
+  try {
+    var r = await fetch('/api/keys', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key,label:label})});
+    var d = await r.json();
+    if (d.ok) { toast('Key 已添加','ok'); $('key-input').value=''; $('key-label').value=''; fetchAll(); }
+    else toast('添加失败: '+d.error,'err');
+  } catch(e) { toast('网络错误','err'); }
+}
+
+async function activateKey(idx) {
+  try {
+    var r = await fetch('/api/keys/activate?index='+idx, {method:'POST'});
+    var d = await r.json();
+    if (d.ok) { toast('Key 已切换','ok'); setTimeout(fetchAll,1500); }
+    else toast('切换失败: '+d.error,'err');
+  } catch(e) { toast('网络错误','err'); }
+}
+
+async function deleteKey(idx) {
+  if (!confirm('确认删除这个 Key?')) return;
+  try {
+    var r = await fetch('/api/keys?index='+idx, {method:'DELETE'});
+    var d = await r.json();
+    if (d.ok) { toast('Key 已删除','ok'); fetchAll(); }
+    else toast('删除失败: '+d.error,'err');
+  } catch(e) { toast('网络错误','err'); }
 }
 
 // ── Init ──
@@ -676,6 +761,17 @@ class Handler(BaseHTTPRequestHandler):
             self.json(200, {"logs": read_logs()})
         elif p == "/api/presets":
             self.json(200, list_presets())
+        elif p == "/api/keys":
+            data = load_keys()
+            # Mask keys for security
+            masked = {"keys": [], "active_index": data["active_index"]}
+            for k in data["keys"]:
+                mk = dict(k)
+                full = mk.get("key", "")
+                if len(full) > 16:
+                    mk["key"] = full[:10] + "..." + full[-6:]
+                masked["keys"].append(mk)
+            self.json(200, masked)
         else:
             self.send_response(404)
             self.end_headers()
@@ -694,6 +790,11 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/presets/load":
             name = q.get("name", [""])[0]
             self.handle_load_preset(name)
+        elif p == "/api/keys":
+            self.handle_add_key()
+        elif p == "/api/keys/activate":
+            idx = int(q.get("index", [0])[0])
+            self.handle_activate_key(idx)
         else:
             self.send_response(404)
             self.end_headers()
@@ -704,6 +805,9 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/presets":
             name = q.get("name", [""])[0]
             self.handle_delete_preset(name)
+        elif p == "/api/keys":
+            idx = int(q.get("index", [0])[0])
+            self.handle_delete_key(idx)
         else:
             self.send_response(404)
             self.end_headers()
@@ -817,6 +921,72 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(404, {"ok": False, "error": "预设不存在"})
                 return
             path.unlink()
+            self.json(200, {"ok": True})
+        except Exception as e:
+            self.json(500, {"ok": False, "error": str(e)})
+
+    def handle_add_key(self):
+        try:
+            data = self.read_body()
+            key = data.get("key", "").strip()
+            if not key:
+                self.json(400, {"ok": False, "error": "Key 不能为空"})
+                return
+            label = data.get("label", "").strip() or None
+            keys_info = load_keys()
+            # Check for duplicates
+            for k in keys_info["keys"]:
+                if k["key"] == key:
+                    self.json(400, {"ok": False, "error": "Key 已存在"})
+                    return
+            keys_info["keys"].append({"key": key, "label": label, "exhausted": False})
+            # If this is the first key, activate it
+            if keys_info["active_index"] < 0 and len(keys_info["keys"]) == 1:
+                keys_info["active_index"] = 0
+                _write_active_key(key)
+            save_keys(keys_info)
+            self.json(200, {"ok": True})
+        except Exception as e:
+            self.json(500, {"ok": False, "error": str(e)})
+
+    def handle_activate_key(self, idx):
+        try:
+            keys_info = load_keys()
+            if idx < 0 or idx >= len(keys_info["keys"]):
+                self.json(400, {"ok": False, "error": "索引无效"})
+                return
+            if keys_info["keys"][idx].get("exhausted"):
+                self.json(400, {"ok": False, "error": "该 Key 已耗尽，无法激活"})
+                return
+            keys_info["active_index"] = idx
+            _write_active_key(keys_info["keys"][idx]["key"])
+            save_keys(keys_info)
+            restart_proxy()
+            self.json(200, {"ok": True})
+        except Exception as e:
+            self.json(500, {"ok": False, "error": str(e)})
+
+    def handle_delete_key(self, idx):
+        try:
+            keys_info = load_keys()
+            if idx < 0 or idx >= len(keys_info["keys"]):
+                self.json(400, {"ok": False, "error": "索引无效"})
+                return
+            removed = keys_info["keys"].pop(idx)
+            # Adjust active_index
+            if keys_info["active_index"] == idx:
+                # Find next non-exhausted key
+                nxt = _find_next_key(keys_info)
+                keys_info["active_index"] = nxt if nxt >= 0 else -1
+                if nxt >= 0:
+                    _write_active_key(keys_info["keys"][nxt]["key"])
+                else:
+                    _write_active_key("${OC_GO_CC_API_KEY}")
+            elif keys_info["active_index"] > idx:
+                keys_info["active_index"] -= 1
+            save_keys(keys_info)
+            if keys_info["active_index"] >= 0:
+                restart_proxy()
             self.json(200, {"ok": True})
         except Exception as e:
             self.json(500, {"ok": False, "error": str(e)})
@@ -947,6 +1117,113 @@ def restart_proxy():
     subprocess.run([str(BINARY), "serve", "-b"], capture_output=True, env=env, timeout=5)
 
 
+# ── Key management helpers ──
+
+def load_keys():
+    """Load keys from keys.json. Returns {keys: [...], active_index: int}."""
+    default = {"keys": [], "active_index": -1}
+    try:
+        if KEYS_PATH.exists():
+            data = json.loads(KEYS_PATH.read_text())
+            # Migrate: ensure exhausted field exists
+            for k in data.get("keys", []):
+                if "exhausted" not in k:
+                    k["exhausted"] = False
+            return data
+    except Exception:
+        pass
+    # Try migrating from current config's api_key
+    try:
+        if CONFIG_PATH.exists():
+            cfg = json.loads(CONFIG_PATH.read_text())
+            api_key = cfg.get("api_key", "")
+            if api_key and api_key != "${OC_GO_CC_API_KEY}" and api_key.startswith("sk-"):
+                default = {"keys": [{"key": api_key, "label": "默认 Key", "exhausted": False}], "active_index": 0}
+                save_keys(default)
+    except Exception:
+        pass
+    return default
+
+
+def save_keys(data):
+    """Save keys to keys.json."""
+    KEYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    KEYS_PATH.write_text(json.dumps(data, indent=2))
+
+
+def _write_active_key(key):
+    """Write the active API key into config.json."""
+    try:
+        with open(CONFIG_PATH) as f:
+            config = json.load(f)
+        config["api_key"] = key
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(config, f, indent=2)
+    except Exception:
+        pass
+
+
+def _find_next_key(keys_info):
+    """Find next non-exhausted key index, or -1."""
+    for i, k in enumerate(keys_info["keys"]):
+        if not k.get("exhausted", False) and i != keys_info["active_index"]:
+            return i
+    # If none found, return any non-exhausted
+    for i, k in enumerate(keys_info["keys"]):
+        if not k.get("exhausted", False):
+            return i
+    return -1
+
+
+def check_key_exhaustion(log_text):
+    """Check recent log for quota-exhausted errors. Returns True if key was rotated."""
+    global _quota_fail_count
+    # Look for 429 / insufficient_quota / billing in last few lines
+    lines = log_text.strip().split("\n")[-20:]
+    found = False
+    for line in lines:
+        if re.search(r"(429|insufficient_quota|exceeded your current quota|InsufficientQuota|billing)", line, re.I):
+            found = True
+            break
+    if not found:
+        _quota_fail_count = 0
+        return False
+    _quota_fail_count += 1
+    # Require 3 consecutive fails before switching
+    if _quota_fail_count < 3:
+        return False
+    _quota_fail_count = 0
+    # Rotate key
+    with _key_rotate_lock:
+        keys_info = load_keys()
+        active = keys_info["active_index"]
+        if active >= 0 and active < len(keys_info["keys"]):
+            keys_info["keys"][active]["exhausted"] = True
+        nxt = _find_next_key(keys_info)
+        if nxt >= 0 and nxt != active:
+            keys_info["active_index"] = nxt
+            _write_active_key(keys_info["keys"][nxt]["key"])
+            save_keys(keys_info)
+            restart_proxy()
+            return True
+        save_keys(keys_info)
+    return False
+
+
+def monitor_logs():
+    """Background thread: periodically check logs for quota exhaustion."""
+    global _last_log_size
+    while True:
+        time.sleep(15)
+        try:
+            if LOG_PATH.exists():
+                text = LOG_PATH.read_text()
+                if text:
+                    check_key_exhaustion(text[-5000:])
+        except Exception:
+            pass
+
+
 # ── Daemonize ──
 
 def daemonize():
@@ -996,6 +1273,9 @@ def main():
     server = HTTPServer((HOST, args.port), Handler)
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
+    # Start background key exhaustion monitor
+    monitor_thread = threading.Thread(target=monitor_logs, daemon=True)
+    monitor_thread.start()
     if not args.background:
         print(f"oc-go-cc Dashboard v2 → http://{HOST}:{args.port}")
     try:
