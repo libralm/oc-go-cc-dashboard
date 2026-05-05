@@ -15,6 +15,7 @@ from urllib.parse import urlparse, parse_qs
 
 CONFIG_PATH = Path.home() / ".config/oc-go-cc/config.json"
 KEYS_PATH = Path.home() / ".config/oc-go-cc/keys.json"
+USAGE_PATH = Path.home() / ".config/oc-go-cc/usage.json"
 PRESETS_DIR = Path.home() / ".config/oc-go-cc/presets"
 BINARY = Path.home() / ".local/bin/oc-go-cc"
 LOG_PATH = Path.home() / ".config/oc-go-cc/oc-go-cc.log"
@@ -149,6 +150,25 @@ input { padding:5px 8px; background:var(--input-bg); color:var(--text); border:1
 
 <div class="metrics-row" id="metrics-row"></div>
 
+<div class="card full" style="margin-bottom:16px" id="usage-card">
+  <h3>用量统计 <span class="badge" id="usage-date">--</span></h3>
+  <div class="usage-bar-wrap" style="justify-content:space-between;margin-bottom:4px">
+    <span style="font-size:11px;color:var(--text2)">今日 Token 消耗</span>
+    <span style="font-size:11px;color:var(--text2)">预估剩余</span>
+  </div>
+  <div style="display:flex;gap:8px;align-items:stretch">
+    <div style="flex:1;background:var(--bg);border-radius:6px;overflow:hidden;height:24px">
+      <div id="usage-bar" style="height:100%;background:linear-gradient(90deg,var(--green),var(--yellow),var(--red));border-radius:6px;transition:width .5s;width:0%"></div>
+    </div>
+    <span style="font-size:12px;white-space:nowrap;color:var(--text2)" id="usage-pct">0%</span>
+  </div>
+  <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:11px;color:var(--text3)">
+    <span id="usage-today">0 token</span>
+    <span>月额度 $10</span>
+  </div>
+  <div id="usage-detail" style="margin-top:10px;font-size:11px;color:var(--text2)"></div>
+</div>
+
 <div class="main-grid">
   <div class="card">
     <h3>熔断器状态 <span class="badge" id="circuit-health">--</span></h3>
@@ -250,6 +270,7 @@ async function fetchAll() {
     var r4 = await fetch('/api/logs'); var logs = r4.ok ? await r4.json() : {};
     var r5 = await fetch('/api/presets'); var presets = r5.ok ? await r5.json() : [];
     var r6 = await fetch('/api/keys'); var keysResp = r6.ok ? await r6.json() : {};
+    var r7 = await fetch('/api/usage'); var usage = r7.ok ? await r7.json() : {};
 
     if (health) {
       renderHeader(health);
@@ -263,6 +284,7 @@ async function fetchAll() {
     if (logs.logs !== undefined) { window._logs = logs.logs; renderLogs(); }
     renderPresets(presets || []);
     renderKeys(keysResp.keys || [], keysResp.active_index);
+    renderUsageStats(usage || {});
     checkAlerts(health ? health.metrics || {} : {}, health ? health.circuit_breakers || {} : {});
     $('footer-time').textContent = new Date().toLocaleTimeString('zh-CN');
   } catch(e) { console.error(e); }
@@ -551,6 +573,57 @@ function renderLogs() {
 
 function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+// ── Usage stats ──
+function renderUsageStats(usage) {
+  var today = usage.today || {};
+  var total = usage.total || {};
+  var date = usage.today_date || '--';
+  $('usage-date').textContent = date;
+
+  var todayTotal = 0;
+  var models = Object.keys(today);
+  for (var i=0;i<models.length;i++) {
+    todayTotal += today[models[i]].input_tokens || 0;
+  }
+  // Rough estimate: input * 1.5 for output + input
+  var estTotal = Math.round(todayTotal * 2.5);
+  // Assume $10/month plan, rough token budget ~50M tokens
+  var MONTHLY_BUDGET = 50000000;
+  var pct = Math.min(100, Math.round(estTotal / MONTHLY_BUDGET * 100));
+  var remaining = MONTHLY_BUDGET - estTotal;
+
+  $('usage-bar').style.width = pct + '%';
+  if (pct > 80) $('usage-bar').style.background = 'var(--red)';
+  else if (pct > 50) $('usage-bar').style.background = 'linear-gradient(90deg,var(--yellow),var(--red))';
+  else $('usage-bar').style.background = 'linear-gradient(90deg,var(--green),var(--yellow))';
+  $('usage-pct').textContent = pct + '%';
+  $('usage-today').textContent = formatTokens(estTotal);
+
+  // Per-model detail
+  var html = '';
+  for (var i=0;i<models.length;i++) {
+    var m = models[i];
+    var inp = today[m].input_tokens || 0;
+    var reqs = today[m].requests || 0;
+    html += '<span style="display:inline-block;margin-right:16px">' + m + ': <strong style="color:var(--accent)">' + formatTokens(inp) + '</strong> (' + reqs + '次)</span>';
+  }
+  if (!models.length) html = '暂无今日用量';
+  $('usage-detail').innerHTML = html;
+
+  // Total stats
+  var totalAll = 0;
+  var totalModels = Object.keys(total);
+  for (var i=0;i<totalModels.length;i++) {
+    totalAll += total[totalModels[i]].input_tokens || 0;
+  }
+}
+
+function formatTokens(n) {
+  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n/1000).toFixed(1) + 'K';
+  return n + '';
+}
+
 // ── Theme ──
 function toggleTheme() {
   document.body.classList.toggle('light');
@@ -772,6 +845,8 @@ class Handler(BaseHTTPRequestHandler):
                     mk["key"] = full[:10] + "..." + full[-6:]
                 masked["keys"].append(mk)
             self.json(200, masked)
+        elif p == "/api/usage":
+            self.json(200, compute_usage())
         else:
             self.send_response(404)
             self.end_headers()
@@ -1105,6 +1180,67 @@ def list_presets():
         return names
     except Exception:
         return []
+
+
+def compute_usage():
+    """Compute token usage from recent logs. Returns {today: {model: {requests, tokens}}, total: {model: {}}}"""
+    today = time.strftime("%Y-%m-%d")
+    result = {"today": {}, "total": {}, "today_date": today}
+
+    # Load persisted usage
+    persisted = {}
+    try:
+        if USAGE_PATH.exists():
+            persisted = json.loads(USAGE_PATH.read_text())
+    except Exception:
+        pass
+
+    # Scan log for today's routing lines
+    try:
+        text = LOG_PATH.read_text()
+        for line in text.split("\n"):
+            m = re.search(r"time=(\d{4}-\d{2}-\d{2}).*routing request.*model=(\S+)\s+tokens=(\d+)", line)
+            if not m:
+                continue
+            date = m.group(1)
+            model = m.group(2)
+            tokens = int(m.group(3))
+
+            if date == today:
+                if model not in result["today"]:
+                    result["today"][model] = {"requests": 0, "input_tokens": 0}
+                result["today"][model]["requests"] += 1
+                result["today"][model]["input_tokens"] += tokens
+    except Exception:
+        pass
+
+    # Merge with persisted data for total
+    persisted_daily = persisted.get("daily", {})
+    for date, models in persisted_daily.items():
+        for model, stats in models.items():
+            if model not in result["total"]:
+                result["total"][model] = {"requests": 0, "input_tokens": 0}
+            result["total"][model]["requests"] += stats.get("requests", 0)
+            result["total"][model]["input_tokens"] += stats.get("input_tokens", 0)
+
+    # Add today's data to total
+    for model, stats in result["today"].items():
+        if model not in result["total"]:
+            result["total"][model] = {"requests": 0, "input_tokens": 0}
+        result["total"][model]["requests"] += stats["requests"]
+        result["total"][model]["input_tokens"] += stats["input_tokens"]
+
+    # Persist today's data
+    if not persisted.get("daily"):
+        persisted["daily"] = {}
+    persisted["daily"][today] = result["today"]
+    try:
+        USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        USAGE_PATH.write_text(json.dumps(persisted, indent=2))
+    except Exception:
+        pass
+
+    return result
 
 
 def restart_proxy():
